@@ -1,57 +1,77 @@
-//! Blinks the LED on a Pico board
+//! This example shows how to communicate asynchronous using i2c with external chips.
 //!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
+//! Example written for the [`MCP23017 16-Bit I2C I/O Expander with Serial Interface`] chip.
+//! (https://www.microchip.com/en-us/product/mcp23017)
+
 #![no_std]
 #![no_main]
-#![allow(async_fn_in_trait)]
 
-use core::str::{self, from_utf8};
-
-// use bsp::entry;
-use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{Config as NetConfig, DhcpConfig, IpEndpoint, Stack, StackResources};
-use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::USB;
-use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::*;
-use embassy_rp::{bind_interrupts, peripherals::DMA_CH0, peripherals::PIO0};
-use embassy_time::{Duration, Timer};
-use panic_probe as _;
-use rand::RngCore;
+
+use embassy_rp::bind_interrupts;
+use embassy_rp::i2c::{self, Config, InterruptHandler};
+use embassy_rp::peripherals::I2C1;
+use embassy_rp::peripherals::USB;
+
+use embassy_time::Timer;
+use embedded_hal_async::i2c::I2c;
 use rp2040_project_template::run;
-use rp2040_project_template::UsbLogger;
-use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-// Provide an alias for our BSP so we can switch targets quickly.
-// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
-// use rp_pico as bsp;
-// use sparkfun_pro_micro_rp2040 as bsp;
-
-// use bsp::hal::{
-//     clocks::{init_clocks_and_plls, Clock},
-//     pac,
-//     sio::Sio,
-//     watchdog::Watchdog,
-// };
-
-const WIFI_NETWORK: &str = env!("WIFI_NETWORK"); // change to your network SSID
-const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
-
-bind_interrupts!(struct Irqs{
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+bind_interrupts!(struct Irqs {
+    I2C1_IRQ => InterruptHandler<I2C1>;
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
+
 });
-#[embassy_executor::task]
-async fn cyw43_task(
-    runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
-) -> ! {
-    runner.run().await
+
+#[allow(dead_code)]
+mod mcp23017 {
+    pub const ADDR: u8 = 0x20; // default addr
+
+    macro_rules! mcpregs {
+        ($($name:ident : $val:expr),* $(,)?) => {
+            $(
+                pub const $name: u8 = $val;
+            )*
+
+            pub fn regname(reg: u8) -> &'static str {
+                match reg {
+                    $(
+                        $val => stringify!($name),
+                    )*
+                    _ => panic!("bad reg"),
+                }
+            }
+        }
+    }
+
+    // These are correct for IOCON.BANK=0
+    mcpregs! {
+        IODIRA: 0x00,
+        IPOLA: 0x02,
+        GPINTENA: 0x04,
+        DEFVALA: 0x06,
+        INTCONA: 0x08,
+        IOCONA: 0x0A,
+        GPPUA: 0x0C,
+        INTFA: 0x0E,
+        INTCAPA: 0x10,
+        GPIOA: 0x12,
+        OLATA: 0x14,
+        IODIRB: 0x01,
+        IPOLB: 0x03,
+        GPINTENB: 0x05,
+        DEFVALB: 0x07,
+        INTCONB: 0x09,
+        IOCONB: 0x0B,
+        GPPUB: 0x0D,
+        INTFB: 0x0F,
+        INTCAPB: 0x11,
+        GPIOB: 0x13,
+        OLATB: 0x15,
+    }
 }
 
 #[embassy_executor::task]
@@ -59,144 +79,49 @@ async fn logger_task(driver: usb::Driver<'static, USB>) {
     run!(1024, log::LevelFilter::Info, driver);
 }
 
-#[embassy_executor::task]
-async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
-    stack.run().await
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-
-    let mut rng = RoscRng;
-
-    let fw = include_bytes!("../assets/43439A0.bin");
-    let clm = include_bytes!("../assets/43439A0_clm.bin");
-
-    let pwr = Output::new(p.PIN_23, Level::Low);
-    let cs = Output::new(p.PIN_25, Level::High);
-    let mut pio = Pio::new(p.PIO0, Irqs);
     let driver = usb::Driver::new(p.USB, Irqs);
     spawner.spawn(logger_task(driver)).unwrap();
-    let spi = PioSpi::new(
-        &mut pio.common,
-        pio.sm0,
-        pio.irq0,
-        cs,
-        p.PIN_24,
-        p.PIN_29,
-        p.DMA_CH0,
-    );
+    let sda = p.PIN_14;
+    let scl = p.PIN_15;
 
-    static STATE: StaticCell<cyw43::State> = StaticCell::new();
-    let state = STATE.init(cyw43::State::new());
-    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    unwrap!(spawner.spawn(cyw43_task(runner)));
-    control.init(clm).await;
+    log::info!("set up i2c ");
+    let mut i2c = i2c::I2c::new_async(p.I2C1, scl, sda, Irqs, Config::default());
 
-    control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
-        .await;
+    use mcp23017::*;
 
-    let delay = Duration::from_millis(300);
-    {
-        let mut scanner = control.scan(Default::default()).await;
-        while let Some(bss) = scanner.next().await {
-            if let Ok(ssid_str) = str::from_utf8(&bss.ssid) {
-                log::info!("scanned {}", ssid_str);
-            }
-        }
-    }
+    log::info!("init mcp23017 config for IxpandO");
+    // init - a outputs, b inputs
+    i2c.write(ADDR, &[IODIRA, 0x00]).await.unwrap();
+    i2c.write(ADDR, &[IODIRB, 0xff]).await.unwrap();
+    i2c.write(ADDR, &[GPPUB, 0xff]).await.unwrap(); // pullups
 
-    let config = NetConfig::dhcpv4(Default::default());
-
-    let seed = rng.next_u64();
-
-    static STACK: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
-    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
-    let stack = &*STACK.init(Stack::new(
-        net_device,
-        config,
-        RESOURCES.init(StackResources::new()),
-        seed,
-    ));
-    let mac_addr = stack.hardware_address();
-    log::info!("Hardware configured. MAC Address is {}", mac_addr);
-
-    unwrap!(spawner.spawn(net_task(stack)));
-
-    control
-        .join_wpa2(WIFI_NETWORK, WIFI_PASSWORD)
-        .await
-        .unwrap();
-
-    for count in 1..10 {
-        if stack.is_config_up() {
-            break;
-        }
-        Timer::after_secs(1).await;
-    }
-
-    match stack.config_v4() {
-        Some(a) => {
-            log::info!("IP: {}", a.address)
-        }
-        None => {
-            log::warn!("Failed GET IP")
-        }
-    }
-
-    let mut udp_rx_meta = [PacketMetadata::EMPTY; 16];
-    let mut udp_rx_buffer = [0; 1024];
-    let mut udp_tx_meta = [PacketMetadata::EMPTY; 16];
-    let mut udp_tx_buffer = [0; 1024];
-    let mut msg_buffer = [0; 128];
-    // I'll reuse the earlier msg_buffer since we're done with the TCP part
-
-    let mut udp_socket = UdpSocket::new(
-        &stack,
-        &mut udp_rx_meta,
-        &mut udp_rx_buffer,
-        &mut udp_tx_meta,
-        &mut udp_tx_buffer,
-    );
-
-    udp_socket.bind(8080).unwrap();
-
-    let mut led: bool = false;
-
+    let mut val = 1;
     loop {
-        if led {
-            log::info!("led on!");
-            control.gpio_set(0, true).await;
-        }
+        let mut portb = [0];
 
-        Timer::after(delay).await;
+        i2c.write_read(mcp23017::ADDR, &[GPIOB], &mut portb)
+            .await
+            .unwrap();
+        log::info!("portb = {:02x}", portb[0]);
+        i2c.write(mcp23017::ADDR, &[GPIOA, val | portb[0]])
+            .await
+            .unwrap();
+        val = val.rotate_left(1);
 
-        while udp_socket.may_recv() {
-            log::info!("recv!");
-            let (rx_size, from_addr) = match udp_socket.recv_from(&mut msg_buffer).await {
-                Ok(a) => a,
-                Err(e) => {
-                    log::warn!("{:?}", e);
-                    continue;
-                }
-            };
-            log::info!("Size: {}", rx_size);
-            let response = from_utf8(&msg_buffer[..rx_size]).unwrap();
-            log::info!("Server replied with {} from {}", response, from_addr);
-
-            if response.contains("led on") {
-                led = true
-            } else if response.contains("led off") {
-                led = false
+        // get a register dump
+        log::info!("getting register dump");
+        let mut regs = [0; 22];
+        i2c.write_read(ADDR, &[0], &mut regs).await.unwrap();
+        // always get the regdump but only display it if portb'0 is set
+        if portb[0] & 1 != 0 {
+            for (idx, reg) in regs.into_iter().enumerate() {
+                log::info!("{} => {:02x}", regname(idx as u8), reg);
             }
         }
 
-        log::info!("led off!");
-        control.gpio_set(0, false).await;
-        Timer::after(delay).await;
+        Timer::after_millis(100).await;
     }
 }
-
-// End of file

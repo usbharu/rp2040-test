@@ -229,7 +229,7 @@ macro_rules! run {
 #[macro_export]
 macro_rules! with_class {
     ( $x:expr, $l:expr, $p:ident ) => {{
-        static LOGGER: ::embassy_usb_logger::UsbLogger<$x> = ::embassy_usb_logger::UsbLogger::new();
+        static LOGGER: UsbLogger<$x> = UsbLogger::new();
         unsafe {
             let _ = ::log::set_logger_racy(&LOGGER).map(|()| log::set_max_level_racy($l));
         }
