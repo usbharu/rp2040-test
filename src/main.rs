@@ -5,20 +5,30 @@
 
 #![no_std]
 #![no_main]
+#![allow(async_fn_in_trait)]
+use core::panic::PanicInfo;
 
-use defmt::*;
+use cortex_m::asm::delay;
+#[panic_handler]
+pub fn panic(info: &PanicInfo) -> ! {
+    loop {
+        log::info!("{}", info);
+        delay(1000000);
+    }
+}
+
+use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_rp::*;
-
 use embassy_rp::bind_interrupts;
 use embassy_rp::i2c::{self, Config, InterruptHandler};
 use embassy_rp::peripherals::I2C1;
 use embassy_rp::peripherals::USB;
+use embassy_rp::*;
+use embedded_hal_1::i2c::I2c;
 
 use embassy_time::Timer;
-use embedded_hal_async::i2c::I2c;
+use mcp230xx::*;
 use rp2040_project_template::run;
-use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     I2C1_IRQ => InterruptHandler<I2C1>;
@@ -84,44 +94,37 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let driver = usb::Driver::new(p.USB, Irqs);
     spawner.spawn(logger_task(driver)).unwrap();
-    let sda = p.PIN_14;
-    let scl = p.PIN_15;
+    let sda = p.PIN_2;
+    let scl = p.PIN_3;
+
+    Timer::after_secs(5).await;
 
     log::info!("set up i2c ");
-    let mut i2c = i2c::I2c::new_async(p.I2C1, scl, sda, Irqs, Config::default());
+    let mut i2c = i2c::I2c::new_blocking(p.I2C1, scl, sda, Config::default());
 
     use mcp23017::*;
 
     log::info!("init mcp23017 config for IxpandO");
+    i2c.write(ADDR, &[IODIRB, 0xff]).unwrap();
     // init - a outputs, b inputs
-    i2c.write(ADDR, &[IODIRA, 0x00]).await.unwrap();
-    i2c.write(ADDR, &[IODIRB, 0xff]).await.unwrap();
-    i2c.write(ADDR, &[GPPUB, 0xff]).await.unwrap(); // pullups
+    // let mut u = Mcp230xx::<I2C, Mcp23017>::default(i2c).unwrap();
 
     let mut val = 1;
     loop {
         let mut portb = [0];
 
         i2c.write_read(mcp23017::ADDR, &[GPIOB], &mut portb)
-            .await
             .unwrap();
-        log::info!("portb = {:02x}", portb[0]);
-        i2c.write(mcp23017::ADDR, &[GPIOA, val | portb[0]])
-            .await
-            .unwrap();
-        val = val.rotate_left(1);
+        log::info!("portb = {:08b}", portb[0]);
 
         // get a register dump
-        log::info!("getting register dump");
-        let mut regs = [0; 22];
-        i2c.write_read(ADDR, &[0], &mut regs).await.unwrap();
-        // always get the regdump but only display it if portb'0 is set
-        if portb[0] & 1 != 0 {
-            for (idx, reg) in regs.into_iter().enumerate() {
-                log::info!("{} => {:02x}", regname(idx as u8), reg);
-            }
-        }
+        // log::info!("getting register dump");
 
         Timer::after_millis(100).await;
     }
+
+    // loop {
+    //     log::info!("aaaaa");
+    //     Timer::after_secs(1).await;
+    // }
 }
