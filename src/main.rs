@@ -109,7 +109,7 @@ async fn main(spawner: Spawner) {
     // init - a outputs, b inputs
     // let mut u = Mcp230xx::<I2C, Mcp23017>::default(i2c).unwrap();
 
-    let mut val = 1;
+    let val = 1;
     loop {
         let mut portb = [0];
 

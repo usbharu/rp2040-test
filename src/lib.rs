@@ -25,7 +25,13 @@ pub struct LoggerState<'d> {
     control_buf: [u8; 64],
 }
 
-impl<'d> LoggerState<'d> {
+impl<'d> Default for LoggerState<'d> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoggerState<'_> {
     /// Create a new instance of the logger state.
     pub fn new() -> Self {
         Self {
@@ -45,6 +51,12 @@ pub const MAX_PACKET_SIZE: u8 = 64;
 pub struct UsbLogger<const N: usize> {
     buffer: Pipe<CS, N>,
     custom_style: Option<fn(&Record, &mut Writer<'_, N>) -> ()>,
+}
+
+impl<const N: usize> Default for UsbLogger<N> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<const N: usize> UsbLogger<N> {
@@ -169,7 +181,7 @@ impl<const N: usize> log::Log for UsbLogger<N> {
 /// A writer that writes to the USB logger buffer.
 pub struct Writer<'d, const N: usize>(&'d Pipe<CS, N>);
 
-impl<'d, const N: usize> core::fmt::Write for Writer<'d, N> {
+impl<const N: usize> core::fmt::Write for Writer<'_, N> {
     fn write_str(&mut self, s: &str) -> Result<(), core::fmt::Error> {
         // The Pipe is implemented in such way that we cannot
         // write across the wraparound discontinuity.
